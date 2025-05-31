@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: promo_user
+      POSTGRES_PASSWORD: promo_pass
+      POSTGRES_DB: promo_db
+    ports:
+      - "5432:5432"
