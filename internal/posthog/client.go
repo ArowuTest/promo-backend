@@ -1,5 +1,3 @@
-// internal/posthog/client.go
-
 package posthog
 
 import (
@@ -8,40 +6,34 @@ import (
 
 	"github.com/ArowuTest/promo-backend/internal/config"
 	"github.com/ArowuTest/promo-backend/internal/models"
-	"github.com/posthog/posthog-go"
 )
 
-// Client wraps a PostHog SDK client.
+// Client is a placeholder around your PostHog integration.
+// For now, FetchEligibleEntries always returns an empty slice.
+// Later you can replace this stub with real PostHog calls.
 type Client struct {
-	ph posthog.Client
+	apiKey   string
+	endpoint string
 }
 
-// NewClient constructs a PostHog client from AppConfig.
-// In your .env or Render env, set POSTHOG_API_KEY and POSTHOG_INSTANCE_ADDRESS.
+// NewClient constructs a “client” using AppConfig.  It does *not* fail if keys are missing.
 func NewClient(cfg *config.AppConfig) (*Client, error) {
-	// This uses the posthog-go v1.x constructor.  You might need to adjust
-	// if PostHog changes their API.  For now, we assume:
-	ph, err := posthog.NewWithConfig(cfg.PosthogAPIKey, posthog.Config{
-		Endpoint: cfg.PosthogEndpoint,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("posthog: failed to create client: %w", err)
+	if cfg.PosthogAPIKey == "" || cfg.PosthogEndpoint == "" {
+		// Missing values, but we’ll still return a Client stub.
+		return &Client{apiKey: cfg.PosthogAPIKey, endpoint: cfg.PosthogEndpoint}, nil
 	}
-	return &Client{ph: ph}, nil
+	return &Client{apiKey: cfg.PosthogAPIKey, endpoint: cfg.PosthogEndpoint}, nil
 }
 
-// Close cleans up the PostHog client.
+// Close is a no-op for now.
 func (c *Client) Close() {
-	c.ph.Close()
+	// no longer holding any connections
 }
 
-// FetchEligibleEntries pulls all “Recharge” events between since & until,
-// and aggregates points per MSISDN.  In production, replace this stub
-// with the real PostHog QueryEvents logic.
+// FetchEligibleEntries should call PostHog, fetch all “Recharge” events (or whatever event name),
+// and return distinct MSISDNs + total points.  For now it returns an empty slice to keep the build green.
 func (c *Client) FetchEligibleEntries(since, until time.Time) ([]models.EligibleEntry, error) {
-	// ────────────────────────────────────────────────────────────────────────────
-	// TODO: Replace this stub with actual PostHog event‐querying logic.
-	// For now, return an empty slice so that the backend compiles and runs.
-	// ────────────────────────────────────────────────────────────────────────────
+	// ==== REPLACE THIS STUB with real PostHog query logic ====
+	fmt.Println("posthog integration is not yet implemented; returning zero entries")
 	return []models.EligibleEntry{}, nil
 }

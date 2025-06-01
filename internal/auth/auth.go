@@ -1,5 +1,3 @@
-// internal/auth/auth.go
-
 package auth
 
 import (
@@ -9,15 +7,15 @@ import (
 	"github.com/dgrijalva/jwt-go"
 )
 
-// JWTSecret holds the signing key (set by config.Init).
+// JWTSecret is set once (in main) from environment.
 var JWTSecret []byte
 
-// Init reads the JWT secret from environment and caches it.
+// Init sets the secret key (call from main).
 func Init(secret string) {
 	JWTSecret = []byte(secret)
 }
 
-// Claims defines the JWT payload for our admin users.
+// Claims defines the payload we embed in the token.
 type Claims struct {
 	UserID   string `json:"user_id"`
 	Username string `json:"username"`
@@ -25,9 +23,8 @@ type Claims struct {
 	jwt.StandardClaims
 }
 
-// GenerateJWT creates a signed token valid for the given duration (e.g. 24h).
-func GenerateJWT(userID, username, role string) (string, error) {
-	ttl := 24 * time.Hour
+// GenerateJWT creates a signed token valid for ttl duration.
+func GenerateJWT(userID, username, role string, ttl time.Duration) (string, error) {
 	now := time.Now()
 	claims := Claims{
 		UserID:   userID,
@@ -38,11 +35,12 @@ func GenerateJWT(userID, username, role string) (string, error) {
 			ExpiresAt: now.Add(ttl).Unix(),
 		},
 	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(JWTSecret)
 }
 
-// ParseAndVerify validates the token string and returns its claims.
+// ParseAndVerify validates tokenString and returns its claims.
 func ParseAndVerify(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
 		// ensure HS256
@@ -54,6 +52,7 @@ func ParseAndVerify(tokenStr string) (*Claims, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
 		return claims, nil
 	}

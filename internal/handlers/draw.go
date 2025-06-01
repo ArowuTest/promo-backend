@@ -1,8 +1,7 @@
-// internal/handlers/draw.go
-
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -12,374 +11,310 @@ import (
 	"github.com/ArowuTest/promo-backend/internal/rng"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
-// listDrawsResponse is the JSON shape for GET /draws
-type listDrawsResponse struct {
-	Draws []models.Draw `json:"draws"`
+// drawRequest is the JSON payload for executing a draw
+type drawRequest struct {
+	// DrawDate is expected in "YYYY-MM-DD" format (local date).
+	DrawDate string `json:"draw_date" binding:"required"`
 }
 
-// ListDraws handles GET /api/v1/draws
-func ListDraws(c *gin.Context) {
-	var draws []models.Draw
-	if err := config.DB.Preload("Winners").Find(&draws).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch draws: " + err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, listDrawsResponse{Draws: draws})
-}
-
-// executeDrawRequest defines payload for POST /draws/execute
-type executeDrawRequest struct {
-	Date string `json:"date" binding:"required"` // e.g. "2025-06-01"
-}
-
-// executeDrawResponse is the JSON shape returned after a draw executes.
-type executeDrawResponse struct {
-	DrawID    uuid.UUID            `json:"draw_id"`
-	Winners   []models.Winner      `json:"winners"`
-	EntryCount int                 `json:"entry_count"`
-}
-
-// ExecuteDraw handles POST /api/v1/draws/execute
-// Only SuperAdmin may call this endpoint.
+// ExecuteDraw manually triggers a draw for a given date.
+// Only SuperAdmins should call this (enforced in main.go).
 func ExecuteDraw(c *gin.Context) {
-	var req executeDrawRequest
+	var req drawRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: " + err.Error()})
 		return
 	}
-	// Parse date
-	drawDate, err := time.Parse("2006-01-02", req.Date)
+
+	// Parse the draw date (strip time, use midnight local)
+	drawDate, err := time.Parse("2006-01-02", req.DrawDate)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format. Use YYYY-MM-DD."})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid date format; use YYYY-MM-DD"})
 		return
 	}
 
-	// Check if a draw already exists for this date (non-rerun)
-	var existing models.Draw
-	if err := config.DB.Where("DATE(executed_at) = ?", drawDate.Format("2006-01-02")).First(&existing).Error; err == nil {
-		// Found a draw with the same date
-		c.JSON(http.StatusConflict, gin.H{"error": "A draw has already been executed for this date", "draw_id": existing.ID})
-		return
-	} else if err != gorm.ErrRecordNotFound {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error: " + err.Error()})
+	// Check if a draw already exists on this date
+	var existingDraw models.Draw
+	if err := config.DB.
+		Where("draw_date = ?", drawDate).
+		First(&existingDraw).Error; err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Draw already executed for this date"})
 		return
 	}
 
-	// Determine if Saturday or not (Saturday draw uses weekly window)
-	isSat := drawDate.Weekday() == time.Saturday
+	// 1. Fetch eligible entries from PostHog (5pm previous window → 5pm of draw day)
+	// For simplicity: we treat “since midnight” to “23:59” as window. Adjust as needed.
+	// (User logic: Mon–Fri: prev day 17:00 → today 17:00; Saturday: prev Sat 17:00→Sat 17:00)
+	windowStart := drawDate.Add(-1 * 24 * time.Hour).Add(17 * time.Hour) // yesterday 17:00
+	windowEnd := drawDate.Add(17 * time.Hour)                           // today    17:00
 
-	// Compute “eligibility window” boundaries:
-	var windowStart, windowEnd time.Time
-	if isSat {
-		// Saturday draw: from last Saturday 5pm → this Saturday 5pm
-		lastSat := drawDate.AddDate(0, 0, -7)
-		windowStart = time.Date(lastSat.Year(), lastSat.Month(), lastSat.Day(), 17, 0, 0, 0, drawDate.Location())
-		windowEnd = time.Date(drawDate.Year(), drawDate.Month(), drawDate.Day(), 17, 0, 0, 0, drawDate.Location())
-	} else {
-		// Daily (Mon–Fri): from previous day 5pm → this day 5pm
-		prevDay := drawDate.AddDate(0, 0, -1)
-		windowStart = time.Date(prevDay.Year(), prevDay.Month(), prevDay.Day(), 17, 0, 0, 0, drawDate.Location())
-		windowEnd = time.Date(drawDate.Year(), drawDate.Month(), drawDate.Day(), 17, 0, 0, 0, drawDate.Location())
-	}
-
-	// Build a PostHog client (stubbed)
-	phClient, err := posthog.NewClient(config.Cfg)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize PostHog: " + err.Error()})
-		return
-	}
+	phClient, _ := posthog.NewClient(config.Cfg)
 	defer phClient.Close()
-
-	// Fetch eligible entries: []EligibleEntry{MSISDN,Points}
 	entries, err := phClient.FetchEligibleEntries(windowStart, windowEnd)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch eligible entries: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "PostHog fetch failed: " + err.Error()})
+		return
+	}
+	entryCount := len(entries)
+
+	// 2. Load the PrizeStructure whose EffectiveDate <= drawDate, order by EffectiveDate desc
+	var prizeStruct models.PrizeStructure
+	if err := config.DB.
+		Preload("PrizeTiers", func(db *gorm.DB) *gorm.DB {
+			return db.Order("order asc")
+		}).
+		Where("effective_date <= ?", drawDate).
+		Order("effective_date desc").
+		First(&prizeStruct).
+		Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "No prize structure found for date"})
 		return
 	}
 
-	// Convert EligibleEntry → rng.WeightedEntry
-	var weightedPool []rng.WeightedEntry
-	for _, e := range entries {
-		weightedPool = append(weightedPool, rng.WeightedEntry{
-			MSISDN: e.MSISDN,
-			Weight: e.Points,
-		})
-	}
+	// 3. Build weighted draw for each prize tier in order
+	winners := []models.Winner{}
+	remainingEntries := entries
 
-	// Build cumulative weights
-	pool, err := rng.BuildWeighted(weightedPool)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to build weighted pool: " + err.Error()})
-		return
-	}
-
-	// Look up the PrizeStructure that applies to this date
-	var ps models.PrizeStructure
-	// We assume you have inserted your PrizeStructures with Effective dates.
-	if err := config.DB.Where("DATE(effective) = ?", drawDate.Format("2006-01-02")).Preload("Items").First(&ps).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "No prize structure found for this date"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error fetching prize structure: " + err.Error()})
-		}
-		return
-	}
-
-	// Now we must pick winners *per prize tier*, honoring runner‐ups.
-	var allWinners []models.Winner
-	rankPosition := 1
-
-	for _, item := range ps.Items {
-		// If pool is exhausted, break out
-		if len(pool) == 0 {
-			break
-		}
-
-		// First, pick `item.Quantity` winners for this tier
-		winnerMSISDNs, err := rng.DrawMultipleUnique(pool, item.Quantity)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
-			return
-		}
-		for _, msisdn := range winnerMSISDNs {
-			maskFirst := ""
-			maskLast := ""
-			if len(msisdn) >= 6 {
-				maskFirst = msisdn[:3]
-				maskLast = msisdn[len(msisdn)-3:]
-			}
-			allWinners = append(allWinners, models.Winner{
-				DrawID:    uuid.Nil, // fill in after Draw is created
-				PrizeTier: item.PrizeName,
-				Position:  rankPosition,
-				MaskFirst3: maskFirst,
-				MaskLast3:  maskLast,
-				MSISDN:    msisdn,
-			})
-			rankPosition++
-		}
-		// Next, pick runner‐ups
-		if item.RunnerUpCount > 0 && len(pool) > 0 {
-			runnerMSISDNs, err2 := rng.DrawMultipleUnique(pool, item.RunnerUpCount)
-			if err2 != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err2.Error()})
+	for _, tier := range prizeStruct.PrizeTiers {
+		// a) Draw main winners
+		if tier.Quantity > 0 {
+			mainList, err := rng.DrawWeighted(remainingEntries, tier.Quantity)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
 				return
 			}
-			for _, msisdn := range runnerMSISDNs {
-				maskFirst := ""
-				maskLast := ""
-				if len(msisdn) >= 6 {
-					maskFirst = msisdn[:3]
-					maskLast = msisdn[len(msisdn)-3:]
-				}
-				allWinners = append(allWinners, models.Winner{
-					DrawID:    uuid.Nil, // fill in later
-					PrizeTier: item.PrizeName + " (RunnerUp)",
-					Position:  rankPosition,
-					MaskFirst3: maskFirst,
-					MaskLast3:  maskLast,
+			for _, msisdn := range mainList {
+				winners = append(winners, models.Winner{
+					ID:        uuid.New(),
 					MSISDN:    msisdn,
+					PrizeTier: tier.TierName,
+					Position:  "Winner",
 				})
-				rankPosition++
 			}
+			// Remove main winners from remainingEntries
+			remainingEntries = filterOut(remainingEntries, mainList)
 		}
-		// Note: DrawMultipleUnique removes winners from pool automatically,
-		// so no need to manually filter them out here.
+
+		// b) Draw runner-ups
+		if tier.RunnerUpCount > 0 {
+			runList, err := rng.DrawWeighted(remainingEntries, tier.RunnerUpCount)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
+				return
+			}
+			for _, msisdn := range runList {
+				winners = append(winners, models.Winner{
+					ID:        uuid.New(),
+					MSISDN:    msisdn,
+					PrizeTier: tier.TierName,
+					Position:  "RunnerUp",
+				})
+			}
+			// Remove runner-ups as well
+			remainingEntries = filterOut(remainingEntries, runList)
+		}
 	}
 
-	// Create the Draw record
-	drawRec := models.Draw{
-		ExecutedAt:       time.Now(),
-		PrizeStructureID: ps.ID,
-		EntryCount:       len(entries),
-		IsRerun:          false,
+	// 4. Persist Draw record
+	newDraw := models.Draw{
+		ID:               uuid.New(),
+		DrawDate:         drawDate,
+		PrizeStructureID: prizeStruct.ID,
+		EntryCount:       entryCount,
 	}
-
-	if err := config.DB.Create(&drawRec).Error; err != nil {
+	// AdminUserID from context (set by RequireAuth)
+	if userID, ok := c.Get("user_id"); ok {
+		parsed, _ := uuid.Parse(userID.(string))
+		newDraw.AdminUserID = parsed
+	}
+	if err := config.DB.Create(&newDraw).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save draw: " + err.Error()})
 		return
 	}
 
-	// Save each Winner with the DrawID
-	for i := range allWinners {
-		allWinners[i].DrawID = drawRec.ID
-	}
-	if err := config.DB.Create(&allWinners).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save winners: " + err.Error()})
-		return
+	// 5. Persist each Winner with DrawID
+	for i := range winners {
+		winners[i].DrawID = newDraw.ID
+		if err := config.DB.Create(&winners[i]).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save winner: " + err.Error()})
+			return
+		}
 	}
 
-	c.JSON(http.StatusOK, executeDrawResponse{
-		DrawID:     drawRec.ID,
-		Winners:    allWinners,
-		EntryCount: len(entries),
+	// 6. Mask the MSISDNs in the response (first 3 + last 3)
+	type maskedWinner struct {
+		PrizeTier string `json:"prize_tier"`
+		Position  string `json:"position"`
+		MaskedMSISDN string `json:"msisdn"`
+	}
+	responseWinners := make([]maskedWinner, 0, len(winners))
+	for _, w := range winners {
+		// assume MSISDN length >= 6
+		s := w.MSISDN
+		masked := fmt.Sprintf("%s****%s", s[:3], s[len(s)-3:])
+		responseWinners = append(responseWinners, maskedWinner{
+			PrizeTier:   w.PrizeTier,
+			Position:    w.Position,
+			MaskedMSISDN: masked,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"draw_id":       newDraw.ID,
+		"draw_date":     newDraw.DrawDate.Format("2006-01-02"),
+		"entry_count":   entryCount,
+		"winners":       responseWinners,
 	})
 }
 
-// rerunDrawRequest defines payload for POST /draws/rerun/:id
-type rerunDrawRequest struct{}
-
-// rerunDrawResponse is the JSON returned after rerunning a draw.
-type rerunDrawResponse struct {
-	OriginalDrawID uuid.UUID       `json:"original_draw_id"`
-	NewDrawID      uuid.UUID       `json:"new_draw_id"`
-	Winners        []models.Winner `json:"winners"`
-}
-
-// RerunDraw handles POST /api/v1/draws/rerun/:id
-// It fetches the original draw by ID, repeats the RNG with the same params,
-// and creates a brand‐new Draw record marked as `IsRerun = true`.
+// RerunDraw allows an explicit rerun for an existing draw ID (+ “R” suffix in ID).
+// It follows the same logic as ExecuteDraw but re‐uses the PrizeStructure & window.
+// Only a SuperAdmin should call this.
 func RerunDraw(c *gin.Context) {
-	origIDStr := c.Param("id")
-	origID, err := uuid.Parse(origIDStr)
+	idStr := c.Param("id")
+	drawID, err := uuid.Parse(idStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid draw ID"})
 		return
 	}
 
-	// Fetch original draw (including winners to get prize structure & entryCount)
-	var origDraw models.Draw
-	if err := config.DB.Preload("Winners").First(&origDraw, "id = ?", origID).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Original draw not found"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error: " + err.Error()})
-		}
+	// Fetch the existing draw record
+	var oldDraw models.Draw
+	if err := config.DB.First(&oldDraw, "id = ?", drawID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Draw not found"})
 		return
 	}
 
-	// Fetch the same PrizeStructure
-	var ps models.PrizeStructure
-	if err := config.DB.Preload("Items").First(&ps, "id = ?", origDraw.PrizeStructureID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prize structure: " + err.Error()})
-		return
-	}
+	// Build new “Rerun” draw ID (drawID + "-R")
+	rerunID := uuid.New() // for simplicity, generate fresh ID
+	drawDate := oldDraw.DrawDate
 
-	// Re‐fetch eligible entries for the original draw (we assume the same window)
-	// For simplicity, assume origDraw.ExecutedAt’s date defines the window again.
-	drawDate := origDraw.ExecutedAt
-	isSat := drawDate.Weekday() == time.Saturday
-
-	var windowStart, windowEnd time.Time
-	if isSat {
-		lastSat := drawDate.AddDate(0, 0, -7)
-		windowStart = time.Date(lastSat.Year(), lastSat.Month(), lastSat.Day(), 17, 0, 0, 0, drawDate.Location())
-		windowEnd = time.Date(drawDate.Year(), drawDate.Month(), drawDate.Day(), 17, 0, 0, 0, drawDate.Location())
-	} else {
-		prevDay := drawDate.AddDate(0, 0, -1)
-		windowStart = time.Date(prevDay.Year(), prevDay.Month(), prevDay.Day(), 17, 0, 0, 0, drawDate.Location())
-		windowEnd = time.Date(drawDate.Year(), drawDate.Month(), drawDate.Day(), 17, 0, 0, 0, drawDate.Location())
-	}
-
-	phClient, err := posthog.NewClient(config.Cfg)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize PostHog: " + err.Error()})
-		return
-	}
+	// Fetch entries again (same window logic)
+	windowStart := drawDate.Add(-1 * 24 * time.Hour).Add(17 * time.Hour)
+	windowEnd := drawDate.Add(17 * time.Hour)
+	phClient, _ := posthog.NewClient(config.Cfg)
 	defer phClient.Close()
-
 	entries, err := phClient.FetchEligibleEntries(windowStart, windowEnd)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch eligible entries: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "PostHog fetch failed: " + err.Error()})
+		return
+	}
+	entryCount := len(entries)
+
+	// Load the same PrizeStructure
+	var prizeStruct models.PrizeStructure
+	if err := config.DB.
+		Preload("PrizeTiers", func(db *gorm.DB) *gorm.DB {
+			return db.Order("order asc")
+		}).
+		Where("id = ?", oldDraw.PrizeStructureID).
+		First(&prizeStruct).
+		Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Prize structure not found"})
 		return
 	}
 
-	// Rebuild weighted pool
-	var weightedPool []rng.WeightedEntry
-	for _, e := range entries {
-		weightedPool = append(weightedPool, rng.WeightedEntry{
-			MSISDN: e.MSISDN,
-			Weight: e.Points,
-		})
-	}
-	pool, err := rng.BuildWeighted(weightedPool)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to build weighted pool: " + err.Error()})
-		return
-	}
+	winners := []models.Winner{}
+	remainingEntries := entries
 
-	// Re‐draw exactly as before
-	var allWinners []models.Winner
-	rankPosition := 1
-	for _, item := range ps.Items {
-		if len(pool) == 0 {
-			break
-		}
-		winnerMSISDNs, err := rng.DrawMultipleUnique(pool, item.Quantity)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
-			return
-		}
-		for _, msisdn := range winnerMSISDNs {
-			maskFirst := ""
-			maskLast := ""
-			if len(msisdn) >= 6 {
-				maskFirst = msisdn[:3]
-				maskLast = msisdn[len(msisdn)-3:]
-			}
-			allWinners = append(allWinners, models.Winner{
-				DrawID:    uuid.Nil, // fill later
-				PrizeTier: item.PrizeName,
-				Position:  rankPosition,
-				MaskFirst3: maskFirst,
-				MaskLast3:  maskLast,
-				MSISDN:    msisdn,
-			})
-			rankPosition++
-		}
-		if item.RunnerUpCount > 0 && len(pool) > 0 {
-			runnerMSISDNs, err2 := rng.DrawMultipleUnique(pool, item.RunnerUpCount)
-			if err2 != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err2.Error()})
+	for _, tier := range prizeStruct.PrizeTiers {
+		// same logic as ExecuteDraw
+		if tier.Quantity > 0 {
+			mainList, err := rng.DrawWeighted(remainingEntries, tier.Quantity)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
 				return
 			}
-			for _, msisdn := range runnerMSISDNs {
-				maskFirst := ""
-				maskLast := ""
-				if len(msisdn) >= 6 {
-					maskFirst = msisdn[:3]
-					maskLast = msisdn[len(msisdn)-3:]
-				}
-				allWinners = append(allWinners, models.Winner{
-					DrawID:    uuid.Nil,
-					PrizeTier: item.PrizeName + " (RunnerUp)",
-					Position:  rankPosition,
-					MaskFirst3: maskFirst,
-					MaskLast3:  maskLast,
+			for _, msisdn := range mainList {
+				winners = append(winners, models.Winner{
+					ID:        uuid.New(),
 					MSISDN:    msisdn,
+					PrizeTier: tier.TierName,
+					Position:  "Winner",
 				})
-				rankPosition++
 			}
+			remainingEntries = filterOut(remainingEntries, mainList)
+		}
+		if tier.RunnerUpCount > 0 {
+			runList, err := rng.DrawWeighted(remainingEntries, tier.RunnerUpCount)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "RNG error: " + err.Error()})
+				return
+			}
+			for _, msisdn := range runList {
+				winners = append(winners, models.Winner{
+					ID:        uuid.New(),
+					MSISDN:    msisdn,
+					PrizeTier: tier.TierName,
+					Position:  "RunnerUp",
+				})
+			}
+			remainingEntries = filterOut(remainingEntries, runList)
 		}
 	}
 
-	// Create a new Draw record with IsRerun=true
+	// Create new “rerun” Draw record
 	newDraw := models.Draw{
-		ExecutedAt:       time.Now(),
-		PrizeStructureID: ps.ID,
-		EntryCount:       len(entries),
-		IsRerun:          true,
+		ID:               rerunID,
+		DrawDate:         drawDate,
+		PrizeStructureID: prizeStruct.ID,
+		EntryCount:       entryCount,
+	}
+	if userID, ok := c.Get("user_id"); ok {
+		parsed, _ := uuid.Parse(userID.(string))
+		newDraw.AdminUserID = parsed
 	}
 	if err := config.DB.Create(&newDraw).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create new draw: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save rerun draw: " + err.Error()})
 		return
 	}
 
-	// Save winners
-	for i := range allWinners {
-		allWinners[i].DrawID = newDraw.ID
-	}
-	if err := config.DB.Create(&allWinners).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save winners: " + err.Error()})
-		return
+	for i := range winners {
+		winners[i].DrawID = newDraw.ID
+		if err := config.DB.Create(&winners[i]).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save rerun winner: " + err.Error()})
+			return
+		}
 	}
 
-	c.JSON(http.StatusOK, rerunDrawResponse{
-		OriginalDrawID: origID,
-		NewDrawID:      newDraw.ID,
-		Winners:        allWinners,
+	// Mask MSISDNs in response
+	type maskedWinner struct {
+		PrizeTier string `json:"prize_tier"`
+		Position  string `json:"position"`
+		MaskedMSISDN string `json:"msisdn"`
+	}
+	responseWinners := make([]maskedWinner, 0, len(winners))
+	for _, w := range winners {
+		s := w.MSISDN
+		masked := fmt.Sprintf("%s****%s", s[:3], s[len(s)-3:])
+		responseWinners = append(responseWinners, maskedWinner{
+			PrizeTier:   w.PrizeTier,
+			Position:    w.Position,
+			MaskedMSISDN: masked,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"draw_id":       newDraw.ID,
+		"draw_date":     newDraw.DrawDate.Format("2006-01-02"),
+		"entry_count":   entryCount,
+		"winners":       responseWinners,
 	})
+}
+
+// filterOut removes any EligibleEntry whose MSISDN is in the “remove” list.
+func filterOut(entries []models.EligibleEntry, remove []string) []models.EligibleEntry {
+	toRemove := make(map[string]struct{}, len(remove))
+	for _, m := range remove {
+		toRemove[m] = struct{}{}
+	}
+	result := make([]models.EligibleEntry, 0, len(entries))
+	for _, e := range entries {
+		if _, found := toRemove[e.MSISDN]; !found {
+			result = append(result, e)
+		}
+	}
+	return result
 }

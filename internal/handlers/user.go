@@ -1,5 +1,3 @@
-// internal/handlers/user.go
-
 package handlers
 
 import (
@@ -11,101 +9,94 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
 )
 
-// createUserRequest defines the expected JSON payload for creating a user.
-type createUserRequest struct {
-	Username string              `json:"username" binding:"required"`
-	Email    string              `json:"email" binding:"required,email"`
-	Password string              `json:"password" binding:"required,min=6"`
-	Role     models.AdminUserRole `json:"role" binding:"required"`
-	Status   models.UserStatus   `json:"status,omitempty"`
-}
-
-// CreateUser handles POST /admin/users
+// CreateUser creates a new admin user.
 func CreateUser(c *gin.Context) {
-	var req createUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var input struct {
+		Username string            `json:"username" binding:"required"`
+		Email    string            `json:"email" binding:"required,email"`
+		Password string            `json:"password" binding:"required,min=6"`
+		Role     models.AdminUserRole `json:"role" binding:"required"`
+		Status   models.UserStatus `json:"status,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: " + err.Error()})
 		return
 	}
 
 	// Validate role
-	switch req.Role {
-	case models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser,
-		models.RoleWinnerReports, models.RoleAllReportsUser:
+	switch input.Role {
+	case models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser, models.RoleWinnerReports, models.RoleAllReportsUser:
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user role"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role"})
 		return
-	}
-	// Validate status if provided
-	if req.Status != "" {
-		switch req.Status {
-		case models.StatusActive, models.StatusInactive, models.StatusLocked:
-			// ok
-		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user status"})
-			return
-		}
 	}
 
 	// Hash password
-	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
 
-	user := models.AdminUser{
-		Username:     req.Username,
-		Email:        req.Email,
+	newUser := models.AdminUser{
+		ID:           uuid.New(),
+		Username:     input.Username,
+		Email:        input.Email,
 		PasswordHash: string(hashed),
-		Role:         req.Role,
-		Status:       req.Status,
+		Role:         input.Role,
 	}
-	// If status not provided, default to Active
-	if user.Status == "" {
-		user.Status = models.StatusActive
+	// Status
+	if input.Status == "" {
+		newUser.Status = models.StatusActive
+	} else {
+		switch input.Status {
+		case models.StatusActive, models.StatusInactive, models.StatusLocked:
+			newUser.Status = input.Status
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status"})
+			return
+		}
 	}
 
-	if err := config.DB.Create(&user).Error; err != nil {
+	if err := config.DB.Create(&newUser).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user: " + err.Error()})
 		return
 	}
-	// Never return the password hash in JSON
-	user.PasswordHash = ""
-	c.JSON(http.StatusCreated, user)
+	// Remove PasswordHash from response
+	newUser.PasswordHash = ""
+	c.JSON(http.StatusCreated, newUser)
 }
 
-// ListUsers handles GET /admin/users
+// ListUsers returns all admin users.
 func ListUsers(c *gin.Context) {
 	var users []models.AdminUser
 	if err := config.DB.Find(&users).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch users: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list users: " + err.Error()})
 		return
 	}
-	// Omit PasswordHash from response
+	// Omit PasswordHash in response
 	for i := range users {
 		users[i].PasswordHash = ""
 	}
 	c.JSON(http.StatusOK, users)
 }
 
-// GetUser handles GET /admin/users/:id
+// GetUser returns one user by ID.
 func GetUser(c *gin.Context) {
 	idStr := c.Param("id")
-	userID, err := uuid.Parse(idStr)
+	uid, err := uuid.Parse(idStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid UUID format"})
 		return
 	}
 	var user models.AdminUser
-	if err := config.DB.First(&user, "id = ?", userID).Error; err != nil {
+	if err := config.DB.First(&user, "id = ?", uid).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error: " + err.Error()})
 		}
 		return
 	}
@@ -113,107 +104,93 @@ func GetUser(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
-// updateUserRequest defines JSON payload for updating a user.
-type updateUserRequest struct {
-	Username string              `json:"username,omitempty"`
-	Email    string              `json:"email,omitempty"`
-	Role     models.AdminUserRole `json:"role,omitempty"`
-	Status   models.UserStatus   `json:"status,omitempty"`
-	Password string              `json:"password,omitempty"`
-}
-
-// UpdateUser handles PUT /admin/users/:id
+// UpdateUser updates an existing user.
 func UpdateUser(c *gin.Context) {
 	idStr := c.Param("id")
-	userID, err := uuid.Parse(idStr)
+	uid, err := uuid.Parse(idStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid UUID"})
 		return
 	}
 
 	var existing models.AdminUser
-	if err := config.DB.First(&existing, "id = ?", userID).Error; err != nil {
+	if err := config.DB.First(&existing, "id = ?", uid).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "DB error: " + err.Error()})
 		}
 		return
 	}
 
-	var req updateUserRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	var payload struct {
+		Username string            `json:"username,omitempty"`
+		Email    string            `json:"email,omitempty"`
+		Role     models.AdminUserRole `json:"role,omitempty"`
+		Status   models.UserStatus `json:"status,omitempty"`
+		Password string            `json:"password,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid payload: " + err.Error()})
 		return
 	}
 
-	// Update fields if provided
-	if req.Username != "" {
-		existing.Username = req.Username
+	if payload.Username != "" {
+		existing.Username = payload.Username
 	}
-	if req.Email != "" {
-		existing.Email = req.Email
+	if payload.Email != "" {
+		existing.Email = payload.Email
 	}
-	if req.Role != "" {
-		switch req.Role {
-		case models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser,
-			models.RoleWinnerReports, models.RoleAllReportsUser:
-			existing.Role = req.Role
+	if payload.Role != "" {
+		switch payload.Role {
+		case models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser, models.RoleWinnerReports, models.RoleAllReportsUser:
+			existing.Role = payload.Role
 		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user role"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid role"})
 			return
 		}
 	}
-	if req.Status != "" {
-		switch req.Status {
+	if payload.Status != "" {
+		switch payload.Status {
 		case models.StatusActive, models.StatusInactive, models.StatusLocked:
-			existing.Status = req.Status
+			existing.Status = payload.Status
 		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user status"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid status"})
 			return
 		}
 	}
-	if req.Password != "" {
-		if len(req.Password) < 6 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters"})
+	if payload.Password != "" {
+		if len(payload.Password) < 6 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Password too short"})
 			return
 		}
-		hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+		h, err := bcrypt.GenerateFromPassword([]byte(payload.Password), bcrypt.DefaultCost)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash new password"})
 			return
 		}
-		existing.PasswordHash = string(hashed)
+		existing.PasswordHash = string(h)
 	}
 
 	if err := config.DB.Save(&existing).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update: " + err.Error()})
 		return
 	}
 	existing.PasswordHash = ""
 	c.JSON(http.StatusOK, existing)
 }
 
-// DeleteUser handles DELETE /admin/users/:id
+// DeleteUser removes a user by ID.
 func DeleteUser(c *gin.Context) {
 	idStr := c.Param("id")
-	userID, err := uuid.Parse(idStr)
+	uid, err := uuid.Parse(idStr)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid UUID"})
 		return
 	}
-	var user models.AdminUser
-	if err := config.DB.First(&user, "id = ?", userID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-		}
+	if err := config.DB.Delete(&models.AdminUser{}, "id = ?", uid).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete: " + err.Error()})
 		return
 	}
-	if err := config.DB.Delete(&models.AdminUser{}, "id = ?", userID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user: " + err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": "Deleted"})
 }

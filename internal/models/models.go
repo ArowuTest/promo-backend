@@ -1,31 +1,24 @@
-// internal/models/models.go
-
 package models
 
 import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
-// ────────────────────────────────────────────────────────────────────────────────
-// AdminUser & Roles & Status
-// ────────────────────────────────────────────────────────────────────────────────
-
-// AdminUserRole enumerates allowed roles in the admin portal.
+// AdminUserRole enumerates allowed roles.
 type AdminUserRole string
 
 const (
-	RoleSuperAdmin     AdminUserRole = "SUPERADMIN"
-	RoleAdmin          AdminUserRole = "ADMIN"
-	RoleSeniorUser     AdminUserRole = "SENIORUSER"
-	RoleWinnerReports  AdminUserRole = "WINNERREPORTS"
-	RoleAllReportsUser AdminUserRole = "ALLREPORTS"
+	RoleSuperAdmin      AdminUserRole = "SUPERADMIN"
+	RoleAdmin           AdminUserRole = "ADMIN"
+	RoleSeniorUser      AdminUserRole = "SENIORUSER"
+	RoleWinnerReports   AdminUserRole = "WINNERREPORTS"
+	RoleAllReportsUser  AdminUserRole = "ALLREPORTS"
 )
 
-// UserStatus enumerates admin‐user account states.
+// UserStatus enumerates user account states.
 type UserStatus string
 
 const (
@@ -34,143 +27,84 @@ const (
 	StatusLocked   UserStatus = "Locked"
 )
 
-// AdminUser is the GORM model for an admin‐portal user.
+// AdminUser is your user model.
 type AdminUser struct {
-	ID           uuid.UUID      `gorm:"type:uuid;default:uuid_generate_v4();primaryKey" json:"id"`
-	Username     string         `gorm:"uniqueIndex;not null"            json:"username"`
-	Email        string         `gorm:"uniqueIndex;not null"            json:"email"`
-	PasswordHash string         `gorm:"not null"                        json:"-"`
-	Role         AdminUserRole  `gorm:"not null"                        json:"role"`
-	Status       UserStatus     `gorm:"not null;default:'Active'"       json:"status"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
+	ID           uuid.UUID      `gorm:"type:uuid;default:uuid_generate_v4();primaryKey"`
+	Username     string         `gorm:"uniqueIndex;not null"`
+	Email        string         `gorm:"uniqueIndex;not null"`
+	PasswordHash string         `gorm:"not null"`
+	Role         AdminUserRole  `gorm:"not null"`
+	Status       UserStatus     `gorm:"not null;default:'Active'"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
-// BeforeCreate hook: generate a new UUID if missing
-func (u *AdminUser) BeforeCreate(tx *gorm.DB) (err error) {
-	if u.ID == uuid.Nil {
-		u.ID = uuid.New()
-	}
-	return
-}
-
-// HashPassword is a helper to hash a plaintext password.
-func HashPassword(pw string) (string, error) {
-	b, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
-	return string(b), err
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// PrizeStructure & PrizeStructureItem
-// ────────────────────────────────────────────────────────────────────────────────
-
-// PrizeStructure represents one date’s set of prize‐tiers and runner‐ups.
+// PrizeStructure represents one “drawing configuration” effective on a given date.
 type PrizeStructure struct {
-	ID         uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey" json:"id"`
-	Effective  time.Time `gorm:"not null"                            json:"effective"`   // date/time when this structure applies
-	IsSaturday bool      `gorm:"not null"                            json:"is_saturday"` // true if a Saturday (weekly) structure
-	Items      []PrizeStructureItem `gorm:"constraint:OnDelete:CASCADE" json:"items"`
-	CreatedAt  time.Time            `json:"created_at"`
-	UpdatedAt  time.Time            `json:"updated_at"`
+	ID          uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey"`
+	EffectiveOn time.Time `gorm:"not null;uniqueIndex"` // only one structure per calendar date
+
+	Currency    string `gorm:"not null;default:'NGN'"` // e.g. “NGN”, “USD”
+	// You could also add a “Name” field if needed (e.g. “Weekday Prize” vs “Saturday Prize”)
+
+	Tiers       []PrizeTier `gorm:"constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
-// PrizeStructureItem is one row in the PrizeStructure (e.g. “Jackpot”, “First Prize”).
-type PrizeStructureItem struct {
-	ID                 uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey" json:"id"`
-	PrizeStructureID   uuid.UUID `gorm:"type:uuid;not null;index"                    json:"prize_structure_id"`
-	PrizeName          string    `gorm:"not null"                                    json:"prize_name"`
-	Quantity           int       `gorm:"not null"                                    json:"quantity"`
-	RunnerUpCount      int       `gorm:"not null"                                    json:"runner_up_count"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+// PrizeTier is one row in a PrizeStructure. E.g. “Jackpot”, “First Prize”, etc.
+type PrizeTier struct {
+	ID               uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey"`
+	PrizeStructureID uuid.UUID `gorm:"type:uuid;not null;index"`
+	TierName         string    `gorm:"not null"` // e.g. “Jackpot” or “First Prize”
+	Quantity         int       `gorm:"not null"` // how many winners in this tier
+	RunnerUpCount    int       `gorm:"not null"` // how many runner‐ups for this tier
+	Amount           int       `gorm:"not null"` // amount in smallest unit, e.g. 10000 = ₦10,000
+
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
-// BeforeCreate hook for PrizeStructure & PrizeStructureItem to assign UUID if missing
-func (p *PrizeStructure) BeforeCreate(tx *gorm.DB) (err error) {
-	if p.ID == uuid.Nil {
-		p.ID = uuid.New()
-	}
-	return
-}
-func (item *PrizeStructureItem) BeforeCreate(tx *gorm.DB) (err error) {
-	if item.ID == uuid.Nil {
-		item.ID = uuid.New()
-	}
-	return
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// Draw & Winner
-// ────────────────────────────────────────────────────────────────────────────────
-
-// Draw records one execution of a draw (daily or weekly).
-// It keeps a snapshot of PrizeStructureID, the window, etc.
+// A “Draw” record, one per date (Mon–Sat) whenever someone clicks “Execute Draw.”
 type Draw struct {
-	ID               uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey" json:"id"`
-	ExecutedAt       time.Time `gorm:"not null"                                        json:"executed_at"`
-	PrizeStructureID uuid.UUID `gorm:"type:uuid;not null;index"                        json:"prize_structure_id"`
-	EntryCount       int       `gorm:"not null"                                        json:"entry_count"`
-	IsRerun          bool      `gorm:"not null;default:false"                          json:"is_rerun"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey"`
+	PrizeStructureID uuid.UUID `gorm:"type:uuid;not null"`
+	DrawDate         time.Time `gorm:"not null;index"` // date/time of draw initiation
+	EntryCount       int       `gorm:"not null"`      // total number of “entries” (sum of points)
 
-	Winners []Winner `gorm:"constraint:OnDelete:CASCADE" json:"winners"`
+	AdminUserID      uuid.UUID  `gorm:"type:uuid;not null;index"` // who ran the draw
+	IsRerun          bool       `gorm:"not null;default:false"`   // true if this is a confirmed re‐run
+	OriginalDrawID   *uuid.UUID `gorm:"type:uuid;default:null"`   // points to original Draw.ID if IsRerun==true
+
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
-// Winner records one winner (or runner‐up) in a specific draw.
+// Winner is one row per winning MSISDN or runner‐up
 type Winner struct {
-	ID           uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey" json:"id"`
-	DrawID       uuid.UUID `gorm:"type:uuid;not null;index"                        json:"draw_id"`
-	PrizeTier    string    `gorm:"not null"                                        json:"prize_tier"`
-	Position     int       `gorm:"not null"                                        json:"position"`    // 1..Quantity+RunnerUps
-	MaskFirst3   string    `gorm:"not null"                                        json:"mask_first3"`
-	MaskLast3    string    `gorm:"not null"                                        json:"mask_last3"`
-	MSISDN       string    `gorm:"not null"                                        json:"-"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID           uuid.UUID `gorm:"type:uuid;default:uuid_generate_v4();primaryKey"`
+	DrawID       uuid.UUID `gorm:"type:uuid;index;not null"`
+	MSISDN       string    `gorm:"not null"` // store full MSISDN in DB
+	MaskedMSISDN string    `gorm:"not null"` // “080XXXYYYZZ” (first 3/last 3)
+	PrizeTier    string    `gorm:"not null"` // e.g. “Jackpot” or “First Prize”
+	Position     string    `gorm:"not null"` // “Winner” vs “RunnerUp”
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
-// BeforeCreate hook to assign UUIDs if missing
-func (d *Draw) BeforeCreate(tx *gorm.DB) (err error) {
-	if d.ID == uuid.Nil {
-		d.ID = uuid.New()
-	}
-	return
-}
-func (w *Winner) BeforeCreate(tx *gorm.DB) (err error) {
-	if w.ID == uuid.Nil {
-		w.ID = uuid.New()
-	}
-	return
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// EligibleEntry & WeightedEntry for RNG
-// ────────────────────────────────────────────────────────────────────────────────
-
-// EligibleEntry is one MSISDN + its total points in the eligibility window.
-// This comes either from PostHog or from the CSV fallback.
+// EligibleEntry is what the PostHog layer (or CSV fallback) returns:
+// one row per MSISDN with a positive integer number of “entries” or points.
 type EligibleEntry struct {
 	MSISDN string
 	Points int
 }
 
-// WeightedEntry is used internally to build a running cumulative‐weight list for RNG.
-type WeightedEntry struct {
-	MSISDN     string
-	Weight     int // the “points” for that MSISDN
-	Cumulative int // the running total up to and including this entry
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// Migrate: run AutoMigrate on all tables
-// ────────────────────────────────────────────────────────────────────────────────
-
+// Migrate will create/update your tables
 func Migrate(db *gorm.DB) {
 	db.AutoMigrate(
 		&AdminUser{},
 		&PrizeStructure{},
-		&PrizeStructureItem{},
+		&PrizeTier{},
 		&Draw{},
 		&Winner{},
 	)

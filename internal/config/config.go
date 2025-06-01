@@ -1,5 +1,3 @@
-// internal/config/config.go
-
 package config
 
 import (
@@ -12,29 +10,28 @@ import (
 	"gorm.io/gorm"
 )
 
-var Cfg *AppConfig // ← global config pointer
-var DB  *gorm.DB   // ← global GORM db handle
+var Cfg *AppConfig
 
-// AppConfig holds all env vars
+// AppConfig holds all environment variables.
 type AppConfig struct {
-	Port            string
-	DBHost          string
-	DBPort          string
-	DBUser          string
-	DBName          string
-	DBPassword      string
-	JWTSecret       string
-	FrontendURL     string
-	PosthogAPIKey   string
-	PosthogEndpoint string
+	Port              string
+	DBHost            string
+	DBPort            string
+	DBUser            string
+	DBName            string
+	DBPassword        string
+	JWTSecret         string
+	FrontendURL       string
+	PosthogAPIKey     string
+	PosthogEndpoint   string
 }
 
-// CORSMiddleware sets CORS headers based on FRONTEND_URL
+// CORSMiddleware allows cross‐origin requests from your frontend.
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", Cfg.FrontendURL)
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -43,10 +40,10 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Load reads environment variables into AppConfig.
-// It also sets the global `Cfg` pointer.
+// Load reads environment variables (and .env if present)
 func Load() *AppConfig {
-	_ = godotenv.Load() // ignore errors if no .env file
+	_ = godotenv.Load()
+
 	Cfg = &AppConfig{
 		Port:            os.Getenv("PORT"),
 		DBHost:          os.Getenv("DB_HOST"),
@@ -65,8 +62,9 @@ func Load() *AppConfig {
 	return Cfg
 }
 
-// InitDB opens a PostgreSQL connection (via GORM) based on AppConfig.
-// It sets the package‐level variable `DB` and also returns it.
+var DB *gorm.DB
+
+// InitDB opens the PostgreSQL connection via GORM.
 func InitDB(c *AppConfig) *gorm.DB {
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable",
@@ -80,7 +78,7 @@ func InitDB(c *AppConfig) *gorm.DB {
 	return db
 }
 
-// CloseDB gracefully closes the underlying SQL connection.
+// CloseDB closes the underlying SQL connection.
 func CloseDB(db *gorm.DB) {
 	if sqlDB, err := db.DB(); err == nil {
 		_ = sqlDB.Close()

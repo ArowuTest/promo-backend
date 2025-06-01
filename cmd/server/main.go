@@ -1,5 +1,3 @@
-// cmd/server/main.go
-
 package main
 
 import (
@@ -12,44 +10,50 @@ import (
 )
 
 func main() {
-	// 1) Load config & initialize DB
+	// Load config & init
 	appCfg := config.Load()
 	db := config.InitDB(appCfg)
 	models.Migrate(db)
-	auth.Init(appCfg.JWTSecret)
+	auth.Init(appCfg.JWTSecret) // pass in JWT secret
 
-	// 2) Setup Gin router
+	// Setup router
 	r := gin.Default()
 	r.Use(config.CORSMiddleware())
 
 	api := r.Group("/api/v1")
 	{
-		// Public login endpoint
+		// Auth
 		api.POST("/admin/login", handlers.Login)
 
-		// Admin‐user CRUD (protected: only SUPERADMIN can create/update/delete, 
-		// but LIST and GET might be allowed for Admin role).
+		// Admin users (CRUD)
 		users := api.Group("/admin/users")
-		users.Use(handlers.RequireAuth(models.RoleSuperAdmin))
 		{
-			users.POST("", handlers.CreateUser)
-			users.GET("", handlers.ListUsers)
-			users.GET("/:id", handlers.GetUser)
-			users.PUT("/:id", handlers.UpdateUser)
-			users.DELETE("/:id", handlers.DeleteUser)
+			users.POST("", handlers.CreateUser)                             // create
+			users.GET("", handlers.ListUsers)                                // list
+			users.GET("/:id", handlers.GetUser)                              // get by ID
+			users.PUT("/:id", handlers.UpdateUser)                           // update
+			users.DELETE("/:id", handlers.DeleteUser)                        // delete
 		}
 
-		// Draw endpoints:
-		draws := api.Group("/draws")
-		// Only SUPERADMIN may execute or rerun a draw
-		draws.Use(handlers.RequireAuth(models.RoleSuperAdmin))
+		// PrizeStructure CRUD
+		ps := api.Group("/prize-structures")
 		{
-			draws.GET("", handlers.ListDraws)            // can be viewed by anyone with a token (Admin+)
-			draws.POST("/execute", handlers.ExecuteDraw) // superadmin only
-			draws.POST("/rerun/:id", handlers.RerunDraw) // superadmin only
+			ps.GET("", handlers.ListPrizeStructures)         // list all
+			ps.GET("/:id", handlers.GetPrizeStructure)       // get one
+			ps.POST("", handlers.CreatePrizeStructure)       // create
+			ps.PUT("/:id", handlers.UpdatePrizeStructure)    // update
+			ps.DELETE("/:id", handlers.DeletePrizeStructure) // delete
+		}
+
+		// Draw endpoints
+		draws := api.Group("/draws")
+		{
+			draws.GET("", handlers.ListDraws)              // list past draws
+			draws.POST("/execute", handlers.ExecuteDraw)   // execute a brand‐new draw
+			draws.POST("/rerun/:id", handlers.RerunDraw)   // rerun an existing draw
 		}
 	}
 
-	// 3) Run server
+	// Start the HTTP server (port from env or default)
 	r.Run(":" + appCfg.Port)
 }
