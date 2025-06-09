@@ -1,83 +1,70 @@
-// cmd/server/main.go
-
 package main
 
 import (
 	"log"
 	"time"
 
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
-
 	"github.com/ArowuTest/promo-backend/internal/auth"
 	"github.com/ArowuTest/promo-backend/internal/config"
 	"github.com/ArowuTest/promo-backend/internal/handlers"
 	"github.com/ArowuTest/promo-backend/internal/models"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
-	// ─── 1) Load config & initialize DB + migrations ──────────────────────────
 	appCfg := config.Load()
 	db := config.InitDB(appCfg)
 	models.Migrate(db)
-
-	// ─── 2) Initialize authentication (e.g. set up JWT) ─────────────────────
 	auth.Init(appCfg.JWTSecret)
 
-	// ─── 3) Create Gin router & register CORS middleware ────────────────────
 	r := gin.Default()
-
-	// This must appear before you register any /api/v1 routes.
 	r.Use(cors.New(cors.Config{
-		AllowOrigins: []string{
-			"https://promo-admin-portal.vercel.app", // your Vercel front-end
-			"http://localhost:3000",                 // for local dev/testing
-		},
+		AllowOrigins:     []string{appCfg.FrontendURL},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Authorization", "Content-Type"},
-		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
-		// How long to cache preflight response in the client:
-		MaxAge: 12 * time.Hour,
+		MaxAge:           12 * time.Hour,
 	}))
 
-	// ─── 4) Register your API routes ─────────────────────────────────────────
-	api := r.Group("/api/v1")
+	apiV1 := r.Group("/api/v1")
 	{
-		// Auth
-		api.POST("/admin/login", handlers.Login)
+		apiV1.POST("/admin/login", handlers.Login)
 
-		// Admin users (CRUD)
-		users := api.Group("/admin/users")
+		authGroup := apiV1.Group("/")
+		authGroup.Use(handlers.RequireAuth())
+
+		userRoutes := authGroup.Group("/admin/users")
+		userRoutes.Use(handlers.RequireAuth(models.RoleSuperAdmin))
 		{
-			users.POST("", handlers.CreateUser)
-			users.GET("", handlers.ListUsers)
-			users.GET("/:id", handlers.GetUser)
-			users.PUT("/:id", handlers.UpdateUser)
-			users.DELETE("/:id", handlers.DeleteUser)
+			userRoutes.POST("", handlers.CreateUser)
+			userRoutes.GET("", handlers.ListUsers)
+			userRoutes.GET("/:id", handlers.GetUser)
+			userRoutes.PUT("/:id", handlers.UpdateUser)
+			userRoutes.DELETE("/:id", handlers.DeleteUser)
 		}
 
-		// PrizeStructure CRUD
-		ps := api.Group("/prize-structures")
+		prizeRoutes := authGroup.Group("/prize-structures")
+		prizeRoutes.Use(handlers.RequireAuth(models.RoleSuperAdmin, models.RoleAdmin))
 		{
-			ps.GET("", handlers.ListPrizeStructures)
-			ps.GET("/:id", handlers.GetPrizeStructure)
-			ps.POST("", handlers.CreatePrizeStructure)
-			ps.PUT("/:id", handlers.UpdatePrizeStructure)
-			ps.DELETE("/:id", handlers.DeletePrizeStructure)
+			prizeRoutes.POST("", handlers.CreatePrizeStructure)
+			prizeRoutes.GET("", handlers.ListPrizeStructures)
+			prizeRoutes.GET("/:id", handlers.GetPrizeStructure)
+			prizeRoutes.PUT("/:id", handlers.UpdatePrizeStructure)
+			prizeRoutes.DELETE("/:id", handlers.DeletePrizeStructure)
 		}
 
-		// Draw endpoints
-		draws := api.Group("/draws")
+		drawRoutes := authGroup.Group("/draws")
 		{
-			draws.GET("", handlers.ListDraws)
-			draws.POST("/execute", handlers.ExecuteDraw)
-			draws.POST("/rerun/:id", handlers.RerunDraw)
+			drawRoutes.GET("", handlers.RequireAuth(models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser), handlers.ListDraws)
+			drawRoutes.GET("/:id/winners", handlers.RequireAuth(models.RoleSuperAdmin, models.RoleAdmin, models.RoleSeniorUser), handlers.ListWinners)
+			drawRoutes.POST("/execute", handlers.RequireAuth(models.RoleSuperAdmin), handlers.ExecuteDraw)
+			drawRoutes.POST("/rerun/:id", handlers.RequireAuth(models.RoleSuperAdmin), handlers.RerunDraw)
 		}
 	}
 
-	// ─── 5) Start HTTP server on configured Port ───────────────────────────────
+	log.Printf("Starting server on port %s", appCfg.Port)
 	if err := r.Run(":" + appCfg.Port); err != nil {
-		log.Fatalf("🚨 server failed to start: %v", err)
+		log.Fatalf("server failed to start: %v", err)
 	}
 }

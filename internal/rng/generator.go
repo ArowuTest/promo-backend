@@ -1,189 +1,155 @@
-// internal/rng/generator.go
-
 package rng
 
 import (
-	"sort"
 	"errors"
+	"sort"
 
 	"github.com/ArowuTest/promo-backend/internal/models"
+	"github.com/google/uuid"
 )
 
-// --------------------------------------------------
-// 1) AES‐CTR CSPRNG Integration
-// --------------------------------------------------
-
-// csprng is a package‐level AES‐CTR generator, seeded once from crypto/rand.
 var csprng *CSPRNG
 
 func init() {
 	var err error
 	csprng, err = NewCSPRNG()
 	if err != nil {
-		// In production, log + exit gracefully. For now, panic so the server fails fast.
-		panic("rng: failed to initialize AES‐CTR CSPRNG: " + err.Error())
+		panic("rng: failed to initialize AES-CTR CSPRNG: " + err.Error())
 	}
 }
 
-// --------------------------------------------------
-// 2) Weighted‐Ticket Draw Logic
-// --------------------------------------------------
-
-// WinnerResult holds a drawn winner/runner‐up result.
 type WinnerResult struct {
 	TierName   string
 	MSISDN     string
 	Position   int
-	PointsUsed int
+	IsRunnerUp bool
 }
 
-// BuildWeightedEntries converts []EligibleEntry → []WeightedEntry with cumulative sums.
 func BuildWeightedEntries(entries []models.EligibleEntry) ([]models.WeightedEntry, int) {
 	var weighted []models.WeightedEntry
 	totalPoints := 0
-
-	// 1) Sum all points, build initial slice
 	for _, e := range entries {
-		totalPoints += e.Points
-		weighted = append(weighted, models.WeightedEntry{
-			MSISDN: e.MSISDN,
-			Weight: e.Points,
-			CumSum: 0, // placeholder; set below
-		})
+		if e.Points > 0 {
+			totalPoints += e.Points
+			weighted = append(weighted, models.WeightedEntry{MSISDN: e.MSISDN, Weight: e.Points})
+		}
 	}
+	sort.Slice(weighted, func(i, j int) bool { return weighted[i].MSISDN < weighted[j].MSISDN })
 
-	// 2) Sort by MSISDN (or any stable key to make CumSum deterministic)
-	sort.Slice(weighted, func(i, j int) bool {
-		return weighted[i].MSISDN < weighted[j].MSISDN
-	})
-
-	// 3) Compute cumulative sums
 	cum := 0
 	for i := range weighted {
 		cum += weighted[i].Weight
 		weighted[i].CumSum = cum
 	}
-
 	return weighted, totalPoints
 }
 
-// pickOneMSISDN draws a single MSISDN from the weighted pool using AES‐CTR CSPRNG.
 func pickOneMSISDN(weighted []models.WeightedEntry, totalPoints int) (string, error) {
-	// 1) Get a 32‐bit random word from AES‐CTR
+	if totalPoints <= 0 {
+		return "", errors.New("cannot pick from a pool with zero total points")
+	}
 	u32, err := csprng.Uint32()
 	if err != nil {
 		return "", err
 	}
-	// 2) Reduce modulo totalPoints to get an index in [0, totalPoints)
 	r := int(u32 % uint32(totalPoints))
-
-	// 3) Binary search on CumSum to pick the winner
-	idx := sort.Search(len(weighted), func(i int) bool {
-		return r < weighted[i].CumSum
-	})
-	if idx < 0 || idx >= len(weighted) {
-		return "", errors.New("rng: index out of range")
+	idx := sort.Search(len(weighted), func(i int) bool { return r < weighted[i].CumSum })
+	if idx >= len(weighted) {
+		return "", errors.New("rng: index out of range during winner selection")
 	}
 	return weighted[idx].MSISDN, nil
 }
 
-// DrawWinners runs a tier‐by‐tier weighted draw, excluding any MSISDN in pastWinners.
-// It returns a map: tier name → slice of WinnerResult.
 func DrawWinners(
 	entries []models.EligibleEntry,
 	tiers []models.PrizeTier,
-	pastWinners map[string]bool,
-) (map[string][]WinnerResult, error) {
-	// 1) Build the weighted pool
+	pastWinsByTier map[string]map[uuid.UUID]bool,
+) ([]WinnerResult, error) {
 	weightedPool, totalPoints := BuildWeightedEntries(entries)
-	result := make(map[string][]WinnerResult)
+	var finalResults []WinnerResult
+	winnersThisDraw := make(map[string]bool)
 
-	// 2) For each tier (in ascending OrderIndex)
+	sort.Slice(tiers, func(i, j int) bool { return tiers[i].OrderIndex < tiers[j].OrderIndex })
+
 	for _, tier := range tiers {
-		var winnersForTier []WinnerResult
-		position := 1
-
-		// Draw main winners
-		for pos := 0; pos < tier.Quantity; pos++ {
-			msisdn, err := pickOneMSISDN(weightedPool, totalPoints)
+		var mainWinnersForTier []string
+		
+		for i := 0; i < tier.Quantity; i++ {
+			winner, err := drawUniqueWinner(&weightedPool, &totalPoints, winnersThisDraw, pastWinsByTier, tier)
 			if err != nil {
+				if err.Error() == "no eligible winners left" { break }
 				return nil, err
 			}
-			// Skip if they have already won this tier previously
-			if pastWinners[msisdn] {
+			mainWinnersForTier = append(mainWinnersForTier, winner)
+		}
+
+		positionCounter := 1
+		for _, winnerMsisdn := range mainWinnersForTier {
+			finalResults = append(finalResults, WinnerResult{TierName: tier.TierName, MSISDN: winnerMsisdn, Position: positionCounter, IsRunnerUp: false})
+			positionCounter++
+		}
+
+		totalRunnerUpsToDraw := len(mainWinnersForTier) * tier.RunnerUpCount
+		runnerUpPositionCounter := 1
+		for i := 0; i < totalRunnerUpsToDraw; i++ {
+			runnerUp, err := drawUniqueWinner(&weightedPool, &totalPoints, winnersThisDraw, pastWinsByTier, tier)
+			if err != nil {
+				if err.Error() == "no eligible winners left" { break }
+				return nil, err
+			}
+			finalResults = append(finalResults, WinnerResult{TierName: tier.TierName, MSISDN: runnerUp, Position: runnerUpPositionCounter, IsRunnerUp: true})
+			runnerUpPositionCounter++
+		}
+	}
+	return finalResults, nil
+}
+
+func drawUniqueWinner(
+	weightedPool *[]models.WeightedEntry,
+	totalPoints *int,
+	winnersThisDraw map[string]bool,
+	pastWinsByTier map[string]map[uuid.UUID]bool,
+	currentTier models.PrizeTier,
+) (string, error) {
+	const maxAttempts = 20000 
+	for i := 0; i < maxAttempts; i++ {
+		if *totalPoints <= 0 { return "", errors.New("no eligible winners left") }
+		
+		selectedMsisdn, err := pickOneMSISDN(*weightedPool, *totalPoints)
+		if err != nil { return "", err }
+
+		if winnersThisDraw[selectedMsisdn] { continue }
+		
+		if pastTiersWon, ok := pastWinsByTier[selectedMsisdn]; ok {
+			if _, hasWonThisTier := pastTiersWon[currentTier.ID]; hasWonThisTier {
 				continue
 			}
-			pastWinners[msisdn] = true
+		}
+		
+		winnersThisDraw[selectedMsisdn] = true
 
-			winnersForTier = append(winnersForTier, WinnerResult{
-				TierName:   tier.TierName,
-				MSISDN:     msisdn,
-				Position:   position,
-				PointsUsed: 0,
-			})
-			position++
-
-			// Remove ALL instances of this MSISDN from weightedPool
-			var newPool []models.WeightedEntry
-			newPool = make([]models.WeightedEntry, 0, len(weightedPool))
-			newTotal := 0
-			for _, we := range weightedPool {
-				if we.MSISDN != msisdn {
-					newPool = append(newPool, we)
-					newTotal += we.Weight
-				}
+		var removedWeight int
+		var newPool []models.WeightedEntry
+		for _, entry := range *weightedPool {
+			if entry.MSISDN != selectedMsisdn {
+				newPool = append(newPool, entry)
+			} else {
+				removedWeight = entry.Weight
 			}
-			weightedPool = newPool
-			totalPoints = newTotal
-
-			// Recompute CumSum on the new pool
+		}
+		
+		if removedWeight > 0 {
+			*weightedPool = newPool
+			*totalPoints -= removedWeight
+			
 			cum := 0
-			for i := range weightedPool {
-				cum += weightedPool[i].Weight
-				weightedPool[i].CumSum = cum
+			for i := range *weightedPool {
+				cum += (*weightedPool)[i].Weight
+				(*weightedPool)[i].CumSum = cum
 			}
 		}
 
-		// Draw runner-ups, if any
-		for rp := 0; rp < tier.RunnerUpCount; rp++ {
-			msisdn, err := pickOneMSISDN(weightedPool, totalPoints)
-			if err != nil {
-				return nil, err
-			}
-			pastWinners[msisdn] = true
-
-			winnersForTier = append(winnersForTier, WinnerResult{
-				TierName:   tier.TierName,
-				MSISDN:     msisdn,
-				Position:   position,
-				PointsUsed: 0,
-			})
-			position++
-
-			// Remove this MSISDN as well
-			var newPool []models.WeightedEntry
-			newPool = make([]models.WeightedEntry, 0, len(weightedPool))
-			newTotal := 0
-			for _, we := range weightedPool {
-				if we.MSISDN != msisdn {
-					newPool = append(newPool, we)
-					newTotal += we.Weight
-				}
-			}
-			weightedPool = newPool
-			totalPoints = newTotal
-
-			// Recompute CumSum
-			cum := 0
-			for i := range weightedPool {
-				cum += weightedPool[i].Weight
-				weightedPool[i].CumSum = cum
-			}
-		}
-
-		// Save results for this tier
-		result[tier.TierName] = winnersForTier
+		return selectedMsisdn, nil
 	}
-
-	return result, nil
+	return "", errors.New("max attempts reached to find a unique winner")
 }
